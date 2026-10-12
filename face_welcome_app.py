@@ -9,7 +9,7 @@ import time
 import tkinter as tk
 from collections import deque
 from dataclasses import dataclass
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 import cv2
 import numpy as np
@@ -462,6 +462,16 @@ class FaceWelcomeApp:
         feature = crop.flatten()
         norm = float(np.linalg.norm(feature))
         return feature / norm if norm else None
+
+    def read_image_file(self, path: str) -> np.ndarray | None:
+        """Read an image safely even when its Windows path contains non-ASCII text."""
+        try:
+            encoded = np.fromfile(path, dtype=np.uint8)
+            if encoded.size == 0:
+                return None
+            return cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+        except (OSError, cv2.error):
+            return None
 
     def extract_sface_feature(self, frame, landmarks: np.ndarray | None) -> np.ndarray | None:
         if not self.sface_model_ready or self.face_recognizer is None or landmarks is None:
@@ -1105,12 +1115,77 @@ class FaceWelcomeApp:
             }.get(feature_type, feature_type)
             messagebox.showinfo("采集完成", f"已保存 1 份人脸样本（{model_label}）。\n{quality_message}\n建议从正面、轻微转头、不同距离各采集几次。", parent=window)
 
+        def upload_samples() -> None:
+            person_id = editing_id["value"]
+            if person_id is None:
+                messagebox.showinfo("先保存人员", "先填写姓名并点击“保存人员”，再上传人脸图片。", parent=window)
+                return
+            paths = filedialog.askopenfilenames(
+                parent=window,
+                title="选择人脸样本图片",
+                filetypes=[
+                    ("图片文件", "*.jpg *.jpeg *.png *.bmp *.webp"),
+                    ("所有文件", "*.*"),
+                ],
+            )
+            if not paths:
+                return
+
+            saved = 0
+            rejected: list[str] = []
+            for path in paths:
+                filename = os.path.basename(path)
+                frame = self.read_image_file(path)
+                if frame is None:
+                    rejected.append(f"{filename}：无法读取图片")
+                    continue
+                detections = self.detect_faces(frame)
+                if not detections:
+                    rejected.append(f"{filename}：没有检测到合格人脸")
+                    continue
+                if len(detections) > 1:
+                    rejected.append(f"{filename}：检测到多张人脸，请使用单人照片")
+                    continue
+                detection = detections[0]
+                quality_ok, quality_message = self.evaluate_sample_quality(frame, detection)
+                if not quality_ok:
+                    rejected.append(f"{filename}：{quality_message}")
+                    continue
+                feature, feature_type = self.extract_recognition_feature(frame, detection)
+                if feature is None:
+                    rejected.append(f"{filename}：无法生成特征，请换一张正面清晰照片")
+                    continue
+                if self.is_duplicate_sample(person_id, feature, feature_type):
+                    rejected.append(f"{filename}：与已有样本过于相似")
+                    continue
+                with sqlite3.connect(self.db_path) as connection:
+                    connection.execute(
+                        "INSERT INTO face_samples(person_id, feature, feature_type) VALUES (?, ?, ?)",
+                        (person_id, feature.astype(np.float32).tobytes(), feature_type),
+                    )
+                self.refresh_people()
+                saved += 1
+
+            reload_tree(person_id)
+            load_selected()
+            result_lines = [f"成功保存 {saved} 份 {self.active_feature_type} 样本。"]
+            if rejected:
+                result_lines.append(f"有 {len(rejected)} 张图片未保存：")
+                result_lines.extend(rejected[:8])
+                if len(rejected) > 8:
+                    result_lines.append(f"……另外 {len(rejected) - 8} 张未显示")
+            result_lines.append("原始图片不会复制到数据库，只保存人脸特征。")
+            if saved:
+                result_lines.append("建议每个人准备 3-5 张不同角度、不同距离的单人照片。")
+            messagebox.showinfo("图片样本处理完成", "\n".join(result_lines), parent=window)
+
         tree.bind("<<TreeviewSelect>>", load_selected)
         actions = tk.Frame(right, bg=BG)
         actions.pack(side="bottom", fill="x")
         tk.Button(actions, text="新建", command=clear_form, fg=TEXT, bg="#1c2c33", relief="flat", bd=0, padx=10, pady=7, font=self._font(9), cursor="hand2").pack(side="left")
         tk.Button(actions, text="保存人员", command=save_person, fg=BG, bg=ACCENT, relief="flat", bd=0, padx=10, pady=7, font=self._font(9, "bold"), cursor="hand2").pack(side="left", padx=6)
         tk.Button(actions, text="采集当前人脸", command=capture_sample, fg=BG, bg=WARN, relief="flat", bd=0, padx=10, pady=7, font=self._font(9, "bold"), cursor="hand2").pack(fill="x", pady=(8, 0))
+        tk.Button(actions, text="从图片上传样本", command=upload_samples, fg=TEXT, bg="#1c2c33", activebackground="#2b414a", relief="flat", bd=0, padx=10, pady=7, font=self._font(9, "bold"), cursor="hand2").pack(fill="x", pady=(6, 0))
         tk.Button(actions, text="删除人员", command=delete_person, fg=DANGER, bg=BG, relief="flat", bd=0, padx=0, pady=7, font=self._font(9), cursor="hand2").pack(anchor="w")
         self._label(right, "", 9, MUTED, bg=BG, textvariable=status_var).pack(side="bottom", anchor="w", pady=(0, 12))
         reload_tree()
