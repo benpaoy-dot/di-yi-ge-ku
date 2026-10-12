@@ -11,6 +11,9 @@ status: 本地仓库已建立
 
 - 首次快照提交：`3e30bc5`（切换 InsightFace ArcFace 主识别方案）
 - 分支：`main`
+- GitHub 远程仓库：`https://github.com/benpaoy-dot/di-yi-ge-ku`
+- 上传状态：已推送到 `origin/main`
+- 最近上传日期：`2026-10-12`
 
 本次快照包含：
 
@@ -38,4 +41,4 @@ status: 本地仓库已建立
 
 在项目目录执行 `git log --oneline` 可以查看版本记录；使用 `git show <提交号>` 可以查看某次快照。恢复后需要单独准备本机的 `face_welcome.db`，再通过人员管理重新录入样本。
 
-当前仓库只建立了本地 Git 历史，尚未配置 GitHub 或其他远程地址，也没有自动上传人员数据。
+当前仓库已经配置 GitHub 远程地址并完成首次推送。后续修改可在项目目录执行 `git add -A`、`git commit` 和 `git push`；人员数据库和人脸特征仍被 `.gitignore` 排除，不会自动上传。
