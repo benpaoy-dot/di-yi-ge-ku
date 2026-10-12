@@ -9,6 +9,9 @@ status: 本地仓库已建立
 
 本地项目目录已经建立 Git 仓库，用于保存方案一切换后的代码、模型和 Obsidian 文档快照。
 
+- 首次快照提交：`3e30bc5`（切换 InsightFace ArcFace 主识别方案）
+- 分支：`main`
+
 本次快照包含：
 
 - `face_welcome_app.py`：InsightFace / SCRFD / ArcFace 主路径，YuNet / SFace 备用路径。
