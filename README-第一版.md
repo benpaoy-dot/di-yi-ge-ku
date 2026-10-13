@@ -3,7 +3,7 @@
 这是可运行的摄像头迎宾程序，当前已实现：
 
 - OpenCV 摄像头预览
-- OpenCV Haar 人脸检测
+- InsightFace / SCRFD 主人脸检测，OpenCV YuNet 和 Haar 备用
 - 深色 AI 中控台界面
 - 人脸识别框上显示姓名、匹配度和 UNKNOWN 状态
 - SQLite 本地人员数据库和“人员管理 / 录入样本”窗口
@@ -18,11 +18,61 @@
 
 升级识别算法后，旧版灰度样本不能转换成 ArcFace 特征；旧 SFace 样本也不能直接当作 ArcFace 样本。首次使用 InsightFace 时，请在“人员管理 / 录入样本”中为每个人重新采集 3-5 份样本，建议包含正面、轻微转头和不同距离。
 
+## 本地环境配置（2026-10-13）
+
+当前配置使用 **Windows x64 / Python 3.10 独立虚拟环境**，不使用系统默认 Python 或 Anaconda 环境。
+
+固定的直接依赖：
+
+| 依赖 | 版本 |
+|---|---|
+| InsightFace | 2.1 |
+| ONNX Runtime（CPU） | 1.23.2 |
+| OpenCV | 4.12.0.88 |
+| NumPy | 2.2.6 |
+
+`requirements.txt` 固定直接依赖；`requirements-lock.txt` 保存本次安装的全部依赖版本。
+Tkinter、SQLite 使用 Python 自带模块，语音使用 Windows `System.Speech`，不需要另外安装 TTS Python 包。
+模型继续使用项目自带的 `models/buffalo_sc/` 和 YuNet / SFace 文件，没有更换模型或识别算法。
+
+### 首次配置或在另一台电脑恢复
+
+先安装 Windows x64 Python 3.10（包含 Tkinter 和 Python 启动器），然后在项目目录运行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\配置项目环境.ps1
+```
+
+脚本会创建 `.venv`、安装锁定依赖并检查实际主识别后端。如果 `.venv` 已存在但版本不兼容，脚本会提示错误，不会删除或覆盖原环境。
+`-ExecutionPolicy Bypass` 仅作用于这次 PowerShell 进程，不修改系统执行策略。
+
+### 环境自检
+
+```powershell
+.\.venv\Scripts\python.exe .\verify_environment.py
+```
+
+自检要求 `active_feature_type=insightface`，仅回退到 OpenCV 不算通过；同时检查 SCRFD、ArcFace、YuNet、SFace 的实际推理、Tkinter 界面构建及临时 SQLite 数据库。
+自检不打开摄像头、不播放语音，也不创建或修改正式人员数据库。它不能代替真实人脸、识别准确率和扬声器现场验收。
+
 ## 启动
 
 1. 连接摄像头。
-2. 双击或在 PowerShell 运行 `启动人脸迎宾程序.ps1`。
-3. 如果程序启动时摄像头还没有连接，连接后点击右侧“重新连接摄像头”。
+2. 在项目目录运行：
+
+   ```powershell
+   powershell -NoProfile -ExecutionPolicy Bypass -File .\启动人脸迎宾程序.ps1
+   ```
+
+   启动脚本固定使用 `.venv\Scripts\python.exe`，无需手动激活环境。也可以直接运行：
+
+   ```powershell
+   .\.venv\Scripts\python.exe .\face_welcome_app.py
+   ```
+
+3. 界面底部应显示 `INSIGHTFACE ENGINE`；如果显示 SFace 或 legacy，说明主识别后端未成功启用，应先运行环境自检。
+4. 如果程序启动时摄像头还没有连接，连接后点击右侧“重新连接摄像头”。
+5. GitHub 仓库不包含人员数据库。在新目录首次正式启动会创建空的 `face_welcome.db`，请单独恢复自己的数据库，或通过人员管理重新录入 3–5 份 InsightFace / ArcFace 样本。
 
 ## 录入人员
 

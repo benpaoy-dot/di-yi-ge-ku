@@ -1,11 +1,11 @@
 ---
 tags: [Git, 版本, 交接, Face-Welcome-AI]
-status: 本地仓库已建立
+status: 本地仓库已关联 GitHub
 ---
 
 # Git 版本记录
 
-## 当前快照
+## 2026-10-12 首次快照
 
 本地项目目录已经建立 Git 仓库，用于保存方案一切换后的代码、模型和 Obsidian 文档快照。
 
@@ -13,7 +13,7 @@ status: 本地仓库已建立
 - 分支：`main`
 - GitHub 远程仓库：`https://github.com/benpaoy-dot/di-yi-ge-ku`
 - 上传状态：已推送到 `origin/main`
-- 最近上传日期：`2026-10-12`
+- 首次上传日期：`2026-10-12`
 
 本次快照包含：
 
@@ -42,3 +42,12 @@ status: 本地仓库已建立
 在项目目录执行 `git log --oneline` 可以查看版本记录；使用 `git show <提交号>` 可以查看某次快照。恢复后需要单独准备本机的 `face_welcome.db`，再通过人员管理重新录入样本。
 
 当前仓库已经配置 GitHub 远程地址并完成首次推送。后续修改可在项目目录执行 `git add -A`、`git commit` 和 `git push`；人员数据库和人脸特征仍被 `.gitignore` 排除，不会自动上传。
+
+
+## 2026-10-13 环境配置与交接
+
+- 当前工作目录为 `C:\Users\HY240\Desktop\di-yi-ge-ku-main`；从下载副本重新建立本地 Git，并关联原仓库 `benpaoy-dot/di-yi-ge-ku` 的 `main` 分支。
+- 提交范围：Python 3.10 环境配置脚本、依赖与锁定清单、环境自检、固定虚拟环境的启动脚本、README 和 Obsidian 交接记录。
+- 本轮主程序与模型文件没有修改；摄像头切换、流畅度优化和外部数据库导入未完成。
+- 数据库、SQLite 辅助文件、虚拟环境和缓存继续忽略。
+- 接手先读 [[交接记录-2026-10-13]]；提交号与远程同步状态用 `git log -1 --oneline` 和 `git status -sb` 查看。

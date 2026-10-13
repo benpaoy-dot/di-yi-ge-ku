@@ -5,3 +5,6 @@ face_welcome.db-shm
 face_welcome.db-wal
 models/*.zip
 *.log
+
+# Local project Python environment
+.venv/
