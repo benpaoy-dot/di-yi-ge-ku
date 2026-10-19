@@ -50,7 +50,13 @@ def main() -> int:
                 if providers != ["CPUExecutionProvider"]:
                     raise RuntimeError(f"Unexpected {task} execution providers: {providers}")
                 print(f"PASS: InsightFace {task} model, CPU inference")
+            if any(detector.empty() for detector in (
+                    app.face_detector, app.eye_detector, app.glasses_eye_detector)):
+                raise RuntimeError("Legacy Haar cascades failed to load")
             blank = np.zeros((480, 640, 3), dtype=np.uint8)
+            if len(app.face_detector.detectMultiScale(cv2.cvtColor(blank, cv2.COLOR_BGR2GRAY))):
+                raise RuntimeError("Haar falsely detected a face in a blank frame")
+            print("PASS: legacy Haar fallback loads from Unicode paths and runs")
             if app.insightface_app.get(blank):
                 raise RuntimeError("InsightFace falsely detected a face in a blank frame")
             print("PASS: SCRFD inference on a blank frame")

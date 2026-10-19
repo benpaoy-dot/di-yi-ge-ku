@@ -2,17 +2,25 @@ from __future__ import annotations
 
 import base64
 import os
+import queue
+from functools import wraps
+from contextlib import closing
 import sqlite3
 import subprocess
 import threading
 import time
 import tkinter as tk
+import traceback
 from collections import deque
 from dataclasses import dataclass
 from tkinter import filedialog, messagebox, ttk
 
 import cv2
 import numpy as np
+from PIL import Image, ImageTk
+
+from camera_pipeline import CameraPipeline, CAMERA_RESOLUTION_PRESETS
+from database_import import import_database, read_import_database
 
 
 BG = "#091116"
@@ -28,6 +36,15 @@ LANGUAGE_OPTIONS = {
     "English · en-US": "en-US",
     "中英双语 · zh-en": "zh-en",
 }
+
+
+def model_locked(method):
+    """Serialize inference, sample extraction and people-cache replacement."""
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._model_lock:
+            return method(self, *args, **kwargs)
+    return wrapped
 
 
 @dataclass
@@ -84,6 +101,9 @@ class FaceWelcomeApp:
         self.root.minsize(1100, 700)
         self.root.configure(bg=BG)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self._show_startup_view()
+        self.root.update_idletasks()
+        self.root.update()
 
         self.db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "face_welcome.db")
         self._init_database()
@@ -96,22 +116,26 @@ class FaceWelcomeApp:
         self.sface_model_ready = False
         self.modern_model_ready = False
         self.active_feature_type = "legacy"
+        self._model_lock = threading.RLock()
         self._load_modern_models()
         self.refresh_people()
 
-        self.capture: cv2.VideoCapture | None = None
+        self.camera_resolution = "auto"
+        self._pipeline = CameraPipeline(self.detect_faces)
+        self._camera_generation = 0
+        self._last_frame_sequence = -1
+        self._last_result_sequence = -1
+        self._last_camera_status = None
+        self._recognition_source = None
+        self._camera_state = 'offline'
+        self._speech_events = queue.SimpleQueue()
+        self.render_ms = 0.0
         self.camera_index = 0
         self.running = True
-        self.frame_photo: tk.PhotoImage | None = None
-        self.face_detector = cv2.CascadeClassifier(
-            os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_alt2.xml")
-        )
-        self.eye_detector = cv2.CascadeClassifier(
-            os.path.join(cv2.data.haarcascades, "haarcascade_eye.xml")
-        )
-        self.glasses_eye_detector = cv2.CascadeClassifier(
-            os.path.join(cv2.data.haarcascades, "haarcascade_eye_tree_eyeglasses.xml")
-        )
+        self.frame_photo: ImageTk.PhotoImage | None = None
+        self.face_detector = self._load_cascade("haarcascade_frontalface_alt2.xml")
+        self.eye_detector = self._load_cascade("haarcascade_eye.xml")
+        self.glasses_eye_detector = self._load_cascade("haarcascade_eye_tree_eyeglasses.xml")
         self.last_detections: list[Detection] = []
         self.current_person: Person | None = None
         self.last_spoken_person_id: int | None = None
@@ -125,12 +149,52 @@ class FaceWelcomeApp:
         self.people_manager_window: tk.Toplevel | None = None
 
         self._build_ui()
-        self.root.after(100, self.open_camera)
+        self._hide_startup_view()
+        self.root.after(100, lambda: self.open_camera(initial=True))
         self.root.after(40, self.update_frame)
         self.root.after(1000, self.update_clock)
 
+    def _show_startup_view(self) -> None:
+        self.startup_view = tk.Frame(self.root, bg=BG)
+        self.startup_view.pack(fill="both", expand=True)
+        tk.Label(
+            self.startup_view,
+            text="FACE WELCOME AI",
+            fg=TEXT,
+            bg=BG,
+            font=("Microsoft YaHei UI", 22, "bold"),
+        ).pack(expand=True, pady=(180, 0))
+        self.startup_status = tk.Label(
+            self.startup_view,
+            text="正在加载人脸识别模型，请稍候…",
+            fg=MUTED,
+            bg=BG,
+            font=("Microsoft YaHei UI", 11),
+        )
+        self.startup_status.pack(pady=(0, 220))
+
+    def _hide_startup_view(self) -> None:
+        if getattr(self, "startup_view", None) is not None:
+            self.startup_view.destroy()
+            self.startup_view = None
+
+    @staticmethod
+    def _load_cascade(filename: str):
+        # Python reads Unicode paths reliably; OpenCV receives XML in memory.
+        path = os.path.join(cv2.data.haarcascades, filename)
+        with open(path, encoding="utf-8") as file:
+            xml = file.read()
+        storage = cv2.FileStorage(xml, cv2.FILE_STORAGE_READ | cv2.FILE_STORAGE_MEMORY)
+        try:
+            detector = cv2.CascadeClassifier()
+            if not detector.read(storage.getFirstTopLevelNode()) or detector.empty():
+                raise RuntimeError(f"无法加载备用人脸检测文件：{filename}")
+            return detector
+        finally:
+            storage.release()
+
     def _init_database(self) -> None:
-        with sqlite3.connect(self.db_path) as connection:
+        with closing(sqlite3.connect(self.db_path)) as connection, connection:
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute(
                 """
@@ -227,8 +291,11 @@ class FaceWelcomeApp:
         else:
             self.active_feature_type = "legacy"
 
+    @model_locked
     def refresh_people(self) -> None:
-        with sqlite3.connect(self.db_path) as connection:
+        old_people = self.people
+        old_samples = self.sample_index
+        with closing(sqlite3.connect(self.db_path)) as connection, connection:
             connection.row_factory = sqlite3.Row
             sample_count_sql = (
                 f"COALESCE(SUM(CASE WHEN s.feature_type = '{self.active_feature_type}' THEN 1 ELSE 0 END), 0)"
@@ -265,6 +332,12 @@ class FaceWelcomeApp:
             feature = np.frombuffer(blob, dtype=np.float32)
             if feature.size:
                 self.sample_index.append((person, feature, feature_type or "legacy"))
+        changed = (old_people != self.people or len(old_samples) != len(self.sample_index)
+                   or any(a[0] != b[0] or a[2] != b[2] or not np.array_equal(a[1], b[1])
+                          for a, b in zip(old_samples, self.sample_index)))
+        if changed and hasattr(self, '_pipeline'):
+            self._camera_generation = self._pipeline.invalidate()
+            self._reset_camera_view()
         if hasattr(self, "db_status_label"):
             count = sum(person.sample_count for person in self.people.values())
             self.db_status_label.configure(text=f"LOCAL DB  ·  {len(self.people)} 人  /  {count} 份样本")
@@ -317,6 +390,7 @@ class FaceWelcomeApp:
         side.grid(row=0, column=1, sticky="nsew")
         side.grid_propagate(False)
         side.grid_rowconfigure(1, weight=1)
+        side.grid_columnconfigure(0, weight=1)
         self._build_identity_panel(side)
         self._build_activity_panel(side)
         footer = tk.Frame(side, bg=BG)
@@ -375,6 +449,30 @@ class FaceWelcomeApp:
         self.voice_text.pack(side="right", padx=(8, 0))
         self.root.after(120, self.animate_wave)
 
+        camera_row = tk.Frame(panel, bg=PANEL)
+        camera_row.pack(fill="x", pady=(12, 0))
+        self._label(camera_row, "摄像头编号", 9, MUTED).pack(side="left")
+        self.camera_choice = tk.StringVar(value="0")
+        ttk.Spinbox(camera_row, from_=0, to=15, width=5,
+                    textvariable=self.camera_choice).pack(side="left", padx=8)
+        tk.Button(camera_row, text="切换", command=self.switch_camera, fg=TEXT,
+                  bg="#1c2c33", relief="flat", padx=12, pady=5,
+                  font=self._font(9), cursor="hand2").pack(side="right")
+
+        resolution_row = tk.Frame(panel, bg=PANEL)
+        resolution_row.pack(fill="x", pady=(9, 0))
+        self._label(resolution_row, "采集分辨率", 9, MUTED).pack(side="left")
+        self.resolution_choice = tk.StringVar(value=CAMERA_RESOLUTION_PRESETS[0][0])
+        self.resolution_values = {label: value for label, value in CAMERA_RESOLUTION_PRESETS}
+        self.resolution_menu = ttk.Combobox(
+            resolution_row,
+            textvariable=self.resolution_choice,
+            values=tuple(self.resolution_values),
+            state="readonly",
+            width=19,
+        )
+        self.resolution_menu.pack(side="right")
+
         button_row = tk.Frame(panel, bg=PANEL)
         button_row.pack(fill="x", pady=(16, 0))
         self.connect_button = tk.Button(button_row, text="重新连接摄像头", command=self.open_camera, fg=BG, bg=ACCENT, activebackground="#a0f8e7", relief="flat", bd=0, padx=12, pady=7, font=self._font(9, "bold"), cursor="hand2")
@@ -415,38 +513,125 @@ class FaceWelcomeApp:
         self.clock_label.configure(text=time.strftime("%H:%M:%S"))
         self.root.after(1000, self.update_clock)
 
-    def open_camera(self) -> None:
-        self.close_capture()
-        for index in [self.camera_index, 1, 2]:
-            capture = cv2.VideoCapture(index, cv2.CAP_DSHOW)
-            if capture.isOpened():
-                capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-                capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-                capture.set(cv2.CAP_PROP_FPS, 30)
-                self.capture = capture
-                self.camera_index = index
-                self.camera_status.configure(text=f"●  CAMERA {index:02d} ONLINE", fg=ACCENT)
-                self.identity_detail.configure(text="人员库已加载 · 等待人脸")
-                return
-            capture.release()
-        self.camera_status.configure(text="●  CAMERA OFFLINE", fg=DANGER)
-        self.identity_detail.configure(text="未找到摄像头，请连接后点击重新连接")
+    def _ensure_workers(self) -> None:
+        self._pipeline.start()
+
+    def _reset_camera_view(self) -> None:
+        self.last_frame = None
+        self.last_detections = []
+        self._recognition_source = None
+        self._last_frame_sequence = self._last_result_sequence = -1
+        self.identity_history.clear()
+        self.current_person = None
+        self.last_spoken_person_id = None
+        self.welcome_flash_until = 0.0
+        self.fps = 0.0
+        self.last_frame_at = time.perf_counter()
+        if hasattr(self, 'identity_name'):
+            self.update_identity_panel(None, False)
+            self.voice_text.configure(text="等待播报", fg=MUTED)
+            self.latency_value.configure(text="--")
+            self.draw_frame(None)
+
+    def switch_camera(self) -> None:
+        try:
+            index = int(self.camera_choice.get())
+            if not 0 <= index <= 15:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning("摄像头编号无效", "请输入 0–15 的整数编号。", parent=self.root)
+            return
+        self.camera_index = index
+        self.open_camera()
+
+    def open_camera(self, initial=False) -> None:
+        # Switching explicitly never silently falls back to another device.
+        resolution = getattr(self, "resolution_choice", None)
+        resolution = self.resolution_values.get(resolution.get(), "auto") if resolution else self.camera_resolution
+        self.camera_resolution = resolution
+        self._camera_generation = self._pipeline.request_camera(
+            self.camera_index,
+            fallback=initial,
+            resolution=resolution,
+        )
+        self._camera_state = 'opening'
+        self._last_camera_status = None
+        self._reset_camera_view()
+        self.camera_status.configure(text=f"●  CAMERA {self.camera_index:02d} CONNECTING", fg=WARN)
+        self.identity_detail.configure(text="正在连接摄像头…")
+        self._ensure_workers()
 
     def close_capture(self) -> None:
-        if self.capture is not None:
-            self.capture.release()
-            self.capture = None
+        self._pipeline.stop()
+
+    def _handle_camera_status(self, status) -> None:
+        if status == self._last_camera_status or status[0] != self._camera_generation:
+            return
+        self._last_camera_status = status
+        _, state, detail = status
+        self._camera_state = state
+        if state == 'online':
+            self.camera_index = int(detail)
+            self.camera_choice.set(str(detail))
+            active_resolution = self._pipeline.resolution()
+            if isinstance(active_resolution, tuple) and len(active_resolution) == 2:
+                resolution_text = f"{active_resolution[0]}×{active_resolution[1]}"
+                self.camera_status.configure(
+                    text=f"●  CAMERA {self.camera_index:02d} ONLINE · {resolution_text}",
+                    fg=ACCENT,
+                )
+                self.identity_detail.configure(text=f"人员库已加载 · 等待人脸 · {resolution_text}")
+            else:
+                self.camera_status.configure(text=f"●  CAMERA {self.camera_index:02d} ONLINE", fg=ACCENT)
+                self.identity_detail.configure(text="人员库已加载 · 等待人脸")
+        elif state == 'recognition_error':
+            self._reset_camera_view()
+            self.camera_status.configure(text=f"●  CAMERA {self.camera_index:02d} · 识别异常", fg=WARN)
+            self.identity_detail.configure(text=str(detail))
+        else:
+            self._reset_camera_view()
+            self.camera_status.configure(text=f"●  CAMERA {self.camera_index:02d} " +
+                                         ("CONNECTING" if state == 'opening' else "OFFLINE"),
+                                         fg=WARN if state == 'opening' else DANGER)
+            self.identity_detail.configure(text=str(detail) or "正在连接摄像头…")
 
     def update_frame(self) -> None:
         if not self.running:
             return
-        if self.capture is not None:
-            ok, frame = self.capture.read()
-            if ok:
-                self.last_frame = frame
-                self.process_frame(frame)
-                self.draw_frame(frame)
-        self.root.after(40, self.update_frame)
+        self._handle_camera_status(self._pipeline.status())
+        source = self._pipeline.latest_frame()
+        result = self._pipeline.latest_result()
+        now = time.perf_counter()
+        if (source is not None and result is not None
+                and result.source.generation == self._camera_generation
+                and now - result.source.timestamp < 1.0
+                and result.source.sequence != self._last_result_sequence
+                and self._camera_state == 'online'):
+            self._last_result_sequence = result.source.sequence
+            self._recognition_source = result.source
+            self.apply_detections(result.detections, result.latency_ms)
+        elif self._recognition_source is not None and (
+                source is None or now - self._recognition_source.timestamp >= 1.0):
+            self._reset_camera_view()
+            self.identity_detail.configure(text="等待新的摄像头画面或识别结果")
+        if source is not None and source.generation == self._camera_generation:
+            if source.sequence != self._last_frame_sequence:
+                self._last_frame_sequence = source.sequence
+                self.last_frame = source.frame
+                delta = now - self.last_frame_at
+                self.fps = 0.8 * self.fps + 0.2 / max(delta, 0.001)
+                self.last_frame_at = now
+                started = time.perf_counter()
+                self.draw_frame(source.frame)
+                self.render_ms = (time.perf_counter() - started) * 1000
+        elif self.last_frame is not None:
+            self._reset_camera_view()
+        while not self._speech_events.empty():
+            generation, success = self._speech_events.get_nowait()
+            if generation == self._camera_generation:
+                self.voice_text.configure(text="播报完成" if success else "播报失败 · 检查系统语音",
+                                          fg=ACCENT if success else DANGER)
+        self.root.after(30, self.update_frame)
 
     def extract_legacy_feature(self, frame, box: tuple[int, int, int, int]) -> np.ndarray | None:
         x, y, w, h = box
@@ -473,6 +658,7 @@ class FaceWelcomeApp:
         except (OSError, cv2.error):
             return None
 
+    @model_locked
     def extract_sface_feature(self, frame, landmarks: np.ndarray | None) -> np.ndarray | None:
         if not self.sface_model_ready or self.face_recognizer is None or landmarks is None:
             return None
@@ -625,6 +811,7 @@ class FaceWelcomeApp:
         # glasses, glare, masks, or mild head turns.
         return True
 
+    @model_locked
     def detect_faces(self, frame) -> list[Detection]:
         if self.insightface_ready and self.insightface_app is not None:
             try:
@@ -718,15 +905,11 @@ class FaceWelcomeApp:
             detections.append(Detection(box, 0.964, person, score, None, "legacy"))
         return detections
 
-    def process_frame(self, frame) -> None:
-        started = time.perf_counter()
-        detections = self.detect_faces(frame)
+    def apply_detections(self, detections: list[Detection], latency_ms: float) -> None:
+        """Apply only fresh results on the Tk main thread."""
         self.last_detections = detections
-        self.latency_value.configure(text=f"{int((time.perf_counter() - started) * 1000)} ms")
+        self.latency_value.configure(text=f"{latency_ms:.0f} ms")
         now = time.perf_counter()
-        delta = now - self.last_frame_at
-        self.fps = 1 / delta if delta > 0 else 0
-        self.last_frame_at = now
 
         recognized = [d for d in detections if d.person is not None]
         best = max(recognized, key=lambda item: item.match_score, default=None)
@@ -798,18 +981,18 @@ class FaceWelcomeApp:
         scale = min(width / source_w, height / source_h)
         target_w, target_h = int(source_w * scale), int(source_h * scale)
         resized = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
-        ok, encoded = cv2.imencode(".png", resized)
-        if ok:
-            self.frame_photo = tk.PhotoImage(data=base64.b64encode(encoded.tobytes()).decode("ascii"))
-            offset_x, offset_y = (width - target_w) // 2, (height - target_h) // 2
-            self.canvas.create_image(offset_x, offset_y, image=self.frame_photo, anchor="nw")
-            self.draw_grid(width, height)
-            for detection in self.last_detections:
-                x, y, w, h = detection.box
-                x1, y1 = offset_x + int(x * scale), offset_y + int(y * scale)
-                x2, y2 = offset_x + int((x + w) * scale), offset_y + int((y + h) * scale)
-                self.draw_face_overlay(x1, y1, x2, y2, detection)
-            self.draw_camera_chrome(width, height)
+        # Pillow transfers RGB directly to Tk: no per-frame PNG compression/Base64.
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        self.frame_photo = ImageTk.PhotoImage(Image.fromarray(rgb), master=self.root)
+        offset_x, offset_y = (width - target_w) // 2, (height - target_h) // 2
+        self.canvas.create_image(offset_x, offset_y, image=self.frame_photo, anchor="nw")
+        self.draw_grid(width, height)
+        for detection in self.last_detections:
+            x, y, w, h = detection.box
+            x1, y1 = offset_x + int(x * scale), offset_y + int(y * scale)
+            x2, y2 = offset_x + int((x + w) * scale), offset_y + int((y + h) * scale)
+            self.draw_face_overlay(x1, y1, x2, y2, detection)
+        self.draw_camera_chrome(width, height)
 
     def draw_placeholder(self, width: int, height: int) -> None:
         self.canvas.delete("all")
@@ -826,6 +1009,9 @@ class FaceWelcomeApp:
             self.canvas.create_line(0, y, width, y, fill="#77ded1", stipple="gray50", width=1)
 
     def draw_camera_chrome(self, width: int, height: int) -> None:
+        self.canvas.create_text(width - 22, 22,
+                                text=f"预览 {self.fps:.1f} FPS · 显示 {self.render_ms:.0f} ms",
+                                anchor="ne", fill="#c4e7e2", font=self._font(9))
         size, gap = 36, 20
         for points in [
             (gap, gap, gap + size, gap, gap, gap + size),
@@ -834,7 +1020,7 @@ class FaceWelcomeApp:
             (width - gap, height - gap, width - gap - size, height - gap, width - gap, height - gap - size),
         ]:
             self.canvas.create_line(*points, fill=ACCENT, width=1)
-        self.canvas.create_text(22, 22, text="CAMERA 01  /  LIVE FEED", anchor="nw", fill="#c4e7e2", font=self._font(9))
+        self.canvas.create_text(22, 22, text=f"CAMERA {self.camera_index:02d}  /  {self._camera_state.upper()}", anchor="nw", fill="#c4e7e2", font=self._font(9))
         self.canvas.create_line(0, int(height * 0.2), width, int(height * 0.2), fill=ACCENT, stipple="gray50")
         if self.current_person and time.perf_counter() < self.welcome_flash_until:
             welcome, subtitle = self.welcome_text(self.current_person), "身份已确认 · 欢迎语已触发"
@@ -905,6 +1091,7 @@ class FaceWelcomeApp:
 
     def speak_person(self, person: Person) -> None:
         text = self.welcome_text(person)
+        generation = self._camera_generation
 
         def worker() -> None:
             def encoded(value: str) -> str:
@@ -944,12 +1131,9 @@ class FaceWelcomeApp:
                     text=True,
                     timeout=30,
                 )
-                if result.returncode == 0:
-                    self.root.after(0, lambda: self.voice_text.configure(text="播报完成", fg=ACCENT))
-                else:
-                    self.root.after(0, lambda: self.voice_text.configure(text="播报失败 · 检查系统语音", fg=DANGER))
+                self._speech_events.put((generation, result.returncode == 0))
             except (OSError, subprocess.SubprocessError):
-                self.root.after(0, lambda: self.voice_text.configure(text="播报失败 · 检查系统语音", fg=DANGER))
+                self._speech_events.put((generation, False))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -961,7 +1145,8 @@ class FaceWelcomeApp:
         window = tk.Toplevel(self.root)
         self.people_manager_window = window
         window.title("人员管理 · Face Welcome AI")
-        window.geometry("900x560")
+        window.geometry("980x760")
+        window.minsize(900, 720)
         window.configure(bg=BG)
         window.protocol("WM_DELETE_WINDOW", window.destroy)
 
@@ -1054,7 +1239,7 @@ class FaceWelcomeApp:
             employee_id = employee_var.get().strip()
             language = LANGUAGE_OPTIONS.get(language_var.get(), "zh-CN")
             try:
-                with sqlite3.connect(self.db_path) as connection:
+                with closing(sqlite3.connect(self.db_path)) as connection, connection:
                     if editing_id["value"] is None:
                         cursor = connection.execute("INSERT INTO people(name, employee_id, language, welcome_text) VALUES (?, ?, ?, ?)", (name, employee_id, language, welcome_var.get().strip()))
                         person_id = int(cursor.lastrowid)
@@ -1074,7 +1259,7 @@ class FaceWelcomeApp:
             person = self.people.get(int(selection[0]))
             if not person or not messagebox.askyesno("删除人员", f"确定删除“{person.name}”及其人脸样本吗？", parent=window):
                 return
-            with sqlite3.connect(self.db_path) as connection:
+            with closing(sqlite3.connect(self.db_path)) as connection, connection:
                 connection.execute("DELETE FROM face_samples WHERE person_id=?", (person.id,))
                 connection.execute("DELETE FROM people WHERE id=?", (person.id,))
             clear_form()
@@ -1085,22 +1270,29 @@ class FaceWelcomeApp:
             if person_id is None:
                 messagebox.showinfo("先保存人员", "先填写姓名并点击“保存人员”，再采集人脸样本。", parent=window)
                 return
-            if self.last_frame is None or not self.last_detections:
+            source = self._recognition_source
+            if (source is None or source.generation != self._camera_generation
+                    or time.perf_counter() - source.timestamp > 1.0
+                    or not self.last_detections or self._camera_state != 'online'):
                 messagebox.showinfo("没有检测到人脸", "请回到摄像头前，确保画面中出现清晰人脸后再采集。", parent=window)
                 return
-            detection = max(self.last_detections, key=lambda item: item.box[2] * item.box[3])
-            quality_ok, quality_message = self.evaluate_sample_quality(self.last_frame, detection)
+            if len(self.last_detections) != 1:
+                messagebox.showwarning("画面有多张人脸", "请只让需要录入的人员出现在画面中。", parent=window)
+                return
+            detection = self.last_detections[0]
+            sample_frame = source.frame
+            quality_ok, quality_message = self.evaluate_sample_quality(sample_frame, detection)
             if not quality_ok:
                 messagebox.showwarning("样本质量不合格", f"{quality_message}。\n请调整姿势、距离或光线后再采集。", parent=window)
                 return
-            feature, feature_type = self.extract_recognition_feature(self.last_frame, detection)
+            feature, feature_type = self.extract_recognition_feature(sample_frame, detection)
             if feature is None:
                 messagebox.showwarning("样本无效", "当前人脸无法完成对齐，请正对摄像头后重试。", parent=window)
                 return
             if self.is_duplicate_sample(person_id, feature, feature_type):
                 messagebox.showinfo("样本重复", "这张样本与该人员已有样本过于相似。请轻微转头或改变距离后再采集。", parent=window)
                 return
-            with sqlite3.connect(self.db_path) as connection:
+            with closing(sqlite3.connect(self.db_path)) as connection, connection:
                 connection.execute(
                     "INSERT INTO face_samples(person_id, feature, feature_type) VALUES (?, ?, ?)",
                     (person_id, feature.astype(np.float32).tobytes(), feature_type),
@@ -1158,7 +1350,7 @@ class FaceWelcomeApp:
                 if self.is_duplicate_sample(person_id, feature, feature_type):
                     rejected.append(f"{filename}：与已有样本过于相似")
                     continue
-                with sqlite3.connect(self.db_path) as connection:
+                with closing(sqlite3.connect(self.db_path)) as connection, connection:
                     connection.execute(
                         "INSERT INTO face_samples(person_id, feature, feature_type) VALUES (?, ?, ?)",
                         (person_id, feature.astype(np.float32).tobytes(), feature_type),
@@ -1179,13 +1371,48 @@ class FaceWelcomeApp:
                 result_lines.append("建议每个人准备 3-5 张不同角度、不同距离的单人照片。")
             messagebox.showinfo("图片样本处理完成", "\n".join(result_lines), parent=window)
 
+        def import_people_database() -> None:
+            path = filedialog.askopenfilename(title="选择要导入的人员数据库", parent=window,
+                                              filetypes=[("SQLite 数据库", "*.db *.sqlite *.sqlite3"), ("所有文件", "*.*")])
+            if not path:
+                return
+            try:
+                if os.path.samefile(path, self.db_path):
+                    raise ValueError("不能把当前人员数据库导入自身")
+                preview = read_import_database(path)
+                types = sorted({row[3] for row in preview.samples})
+                if not messagebox.askyesno(
+                    "确认安全导入",
+                    f"来源包含 {len(preview.people)} 名人员、{len(preview.samples)} 份样本。\n"
+                    f"特征类型：{', '.join(types) or '无样本'}\n\n"
+                    "会先备份当前数据库，再添加新人员和样本。\n"
+                    "姓名或员工编号冲突的人员及其样本会跳过，不会覆盖或合并已有身份。\n"
+                    "不同模型的样本不会自动转换，仅当前识别模型的样本可用于匹配。\n"
+                    "请确认来源可信，且已取得人员授权。是否继续？", parent=window):
+                    return
+                summary = import_database(path, self.db_path)
+                self.refresh_people()
+                clear_form()
+                reload_tree()
+                messagebox.showinfo("导入完成",
+                                    f"新增 {summary.people_added} 名人员、{summary.samples_added} 份样本。\n"
+                                    f"跳过 {summary.people_skipped} 名冲突人员。\n"
+                                    f"导入前备份：\n{summary.backup_path}", parent=window)
+            except (ValueError, OSError, sqlite3.Error) as error:
+                messagebox.showerror("未能导入", str(error), parent=window)
+
         tree.bind("<<TreeviewSelect>>", load_selected)
         actions = tk.Frame(right, bg=BG)
         actions.pack(side="bottom", fill="x")
-        tk.Button(actions, text="新建", command=clear_form, fg=TEXT, bg="#1c2c33", relief="flat", bd=0, padx=10, pady=7, font=self._font(9), cursor="hand2").pack(side="left")
-        tk.Button(actions, text="保存人员", command=save_person, fg=BG, bg=ACCENT, relief="flat", bd=0, padx=10, pady=7, font=self._font(9, "bold"), cursor="hand2").pack(side="left", padx=6)
+        edit_row = tk.Frame(actions, bg=BG)
+        edit_row.pack(fill="x", pady=(0, 2))
+        tk.Button(edit_row, text="新建", command=clear_form, fg=TEXT, bg="#1c2c33", relief="flat", bd=0, padx=10, pady=7, font=self._font(9), cursor="hand2").pack(side="left")
+        tk.Button(edit_row, text="保存人员", command=save_person, fg=BG, bg=ACCENT, relief="flat", bd=0, padx=10, pady=7, font=self._font(9, "bold"), cursor="hand2").pack(side="left", padx=6)
         tk.Button(actions, text="采集当前人脸", command=capture_sample, fg=BG, bg=WARN, relief="flat", bd=0, padx=10, pady=7, font=self._font(9, "bold"), cursor="hand2").pack(fill="x", pady=(8, 0))
         tk.Button(actions, text="从图片上传样本", command=upload_samples, fg=TEXT, bg="#1c2c33", activebackground="#2b414a", relief="flat", bd=0, padx=10, pady=7, font=self._font(9, "bold"), cursor="hand2").pack(fill="x", pady=(6, 0))
+        tk.Button(actions, text="导入已有人员数据库", command=import_people_database,
+                  fg=TEXT, bg="#1c2c33", relief="flat", padx=10, pady=7,
+                  font=self._font(9), cursor="hand2").pack(fill="x", pady=(6, 0))
         tk.Button(actions, text="删除人员", command=delete_person, fg=DANGER, bg=BG, relief="flat", bd=0, padx=0, pady=7, font=self._font(9), cursor="hand2").pack(anchor="w")
         self._label(right, "", 9, MUTED, bg=BG, textvariable=status_var).pack(side="bottom", anchor="w", pady=(0, 12))
         reload_tree()
@@ -1199,9 +1426,31 @@ class FaceWelcomeApp:
 
 
 def main() -> None:
-    root = tk.Tk()
-    FaceWelcomeApp(root)
-    root.mainloop()
+    root = None
+    try:
+        root = tk.Tk()
+        FaceWelcomeApp(root)
+        root.mainloop()
+    except Exception as error:
+        details = traceback.format_exc()
+        try:
+            if root is not None:
+                from tkinter import messagebox
+
+                messagebox.showerror(
+                    "Face Welcome AI 启动失败",
+                    f"{type(error).__name__}: {error}\n\n请从启动窗口中查看完整错误信息。",
+                    parent=root,
+                )
+        except Exception:
+            pass
+        print(details, flush=True)
+        if root is not None:
+            try:
+                root.destroy()
+            except tk.TclError:
+                pass
+        raise
 
 
 if __name__ == "__main__":

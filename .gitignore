@@ -8,3 +8,6 @@ models/*.zip
 
 # Local project Python environment
 .venv/
+
+# Backups contain personal face embeddings; never commit them.
+database-backups/
